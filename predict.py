@@ -5,7 +5,8 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from utils import clean_text, extract_url_features, clickbait_score
 
-ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "artifacts")
+ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "microsoft/deberta-v3-large")
+
 
 class FakeNewsMeter:
     def __init__(self, model_dir: str = ARTIFACTS_DIR):
