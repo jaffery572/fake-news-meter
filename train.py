@@ -50,7 +50,8 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print("Loading dataset: liar")
-    ds = load_dataset("liar")
+   ds = load_dataset("liar", trust_remote_code=True)
+
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
 
