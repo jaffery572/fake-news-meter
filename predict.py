@@ -1,52 +1,56 @@
 import os
-import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from utils import clean_text, extract_url_features, clickbait_score
 
-ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "microsoft/deberta-v3-large")
+# Order matters:
+# 1) If repo has artifacts/ folder -> use it
+# 2) else use env var MODEL_ID (Streamlit secrets)
+# 3) else fallback to a public HF model (always available)
+DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "distilbert-base-uncased-finetuned-sst-2-english")
+LOCAL_ARTIFACTS = "artifacts"
 
+def pick_model_source():
+    if os.path.isdir(LOCAL_ARTIFACTS) and os.path.exists(os.path.join(LOCAL_ARTIFACTS, "config.json")):
+        return LOCAL_ARTIFACTS
+    return DEFAULT_MODEL_ID
 
 class FakeNewsMeter:
-    def __init__(self, model_dir: str = ARTIFACTS_DIR):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+    def __init__(self):
+        self.source = pick_model_source()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.source, use_fast=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.source)
         self.model.eval()
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
     @torch.no_grad()
     def predict(self, text: str, url: str = ""):
-        """
-        Returns:
-          label: "LIKELY_TRUE" or "LIKELY_FALSE"
-          confidence: float in [0,1]
-          signals: small explainability hints (heuristics)
-        """
         text = clean_text(text)
         feats = extract_url_features(url)
         cb = clickbait_score(text)
 
-        # We feed only text to transformer (fast + robust),
-        # and provide heuristics as extra "signals" in output UI.
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         out = self.model(**inputs)
+
         probs = torch.softmax(out.logits, dim=-1).cpu().numpy()[0]
 
-        # class 1 = "true-ish", class 0 = "false-ish"
-        true_p = float(probs[1])
-        false_p = float(probs[0])
+        # Generic classifier support:
+        # If model has 2 labels: pick higher prob
+        pred_idx = int(probs.argmax())
+        conf = float(probs[pred_idx])
 
-        label = "LIKELY_TRUE" if true_p >= 0.5 else "LIKELY_FALSE"
-        confidence = max(true_p, false_p)
+        label = "LIKELY_FALSE" if pred_idx == 0 else "LIKELY_TRUE"
 
         signals = {
+            "model_source": self.source,
             "clickbait_score": cb,
             "url_has_https": feats["is_https"],
             "url_tld_suspicious": feats["tld_suspicious"],
             "url_has_ip": feats["has_ip"],
             "url_num_dots": feats["num_dots"],
         }
-        return label, confidence, {"true_prob": true_p, "false_prob": false_p}, signals
+        return label, conf, {"probs": probs.tolist()}, signals
