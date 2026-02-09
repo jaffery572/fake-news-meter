@@ -2,6 +2,8 @@ import os
 import re
 import time
 import hashlib
+from urllib.parse import urlparse
+
 import torch
 import requests
 from bs4 import BeautifulSoup
@@ -11,13 +13,25 @@ from duckduckgo_search import DDGS
 
 from utils import clean_text, extract_url_features, clickbait_score
 
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
+
+
 ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "artifacts")
 BASE_MODEL = os.getenv("BASE_MODEL", "microsoft/deberta-v3-large")
 
-# Evidence settings
-EVIDENCE_K = int(os.getenv("EVIDENCE_K", "7"))
-MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "20"))
+# Evidence mode tuning
+EVIDENCE_K = int(os.getenv("EVIDENCE_K", "7"))                    # show top K evidence cards
+SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "120"))          # how many DDG results to collect
+FETCH_TOP = int(os.getenv("FETCH_TOP", "16"))                     # how many pages to actually fetch (avoid timeout)
 STRICT_TRUSTED_ONLY = os.getenv("STRICT_TRUSTED_ONLY", "0") == "1"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "2"))
+
+# lightweight similarity threshold (0-1), higher = stricter matching
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.28"))
 
 
 # =========================
@@ -26,11 +40,9 @@ STRICT_TRUSTED_ONLY = os.getenv("STRICT_TRUSTED_ONLY", "0") == "1"
 class FakeNewsMeter:
     def __init__(self, model_dir: str = ARTIFACTS_DIR):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
         base = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL, num_labels=2)
         self.model = PeftModel.from_pretrained(base, model_dir)
-
         self.model.eval()
         self.model.to(self.device)
 
@@ -63,208 +75,314 @@ class FakeNewsMeter:
 
 
 # ==========================================
-# 2) EVIDENCE CHECKER (REAL / SOURCE-BASED)
+# 2) EVIDENCE CHECKER (INTERNATIONAL + LOCAL)
 # ==========================================
 class EvidenceChecker:
     """
-    Evidence checker that:
-    - searches the web (DuckDuckGo)
-    - ranks sources (trusted domains boosted)
-    - returns exactly top-K evidence with SUPPORT/REFUTE/NEUTRAL tags
-    - produces verdict: TRUE / FALSE / UNKNOWN (no guessing)
+    - Collects 100+ search results (snippets)
+    - Splits sources into INTERNATIONAL vs LOCAL
+    - Clusters by similarity (do both sides talk about same thing?)
+    - Fetches only top N pages to avoid timeouts
+    - Verdict is strict: TRUE / FALSE / UNKNOWN
     """
 
-    def __init__(self, timeout: int = 12, retries: int = 2):
-        self.timeout = timeout
-        self.retries = retries
-        self.headers = {"User-Agent": "Mozilla/5.0 (FakeNewsMeter/1.0)"}
+    def __init__(self):
+        self.timeout = REQUEST_TIMEOUT
+        self.retries = REQUEST_RETRIES
+        self.headers = {"User-Agent": "Mozilla/5.0 (FakeNewsMeter/3.0)"}
+        self._page_cache = {}
+        self._query_cache = {}
 
-        # Trusted domains get higher score (not automatically "true", just higher priority)
-        self.trusted_domains = [
-            "bbc.com", "bbc.co.uk",
-            "reuters.com",
-            "apnews.com",
-            "who.int", "cdc.gov",
-            ".gov",
-            "wikipedia.org",
+        # INTERNATIONAL sources (examples)
+        self.international_domains = [
+            "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
+            "aljazeera.com", "theguardian.com", "nytimes.com",
+            "washingtonpost.com", "cnn.com", "dw.com", "france24.com",
+            "who.int", "cdc.gov", ".gov", "wikipedia.org",
             "politifact.com", "snopes.com", "factcheck.org", "afp.com",
         ]
 
-        # Keyword signals (simple + deploy-safe)
-        self.refute_words = ["false", "fake", "hoax", "misleading", "debunk", "not true", "rumor", "rumour"]
-        self.support_words = ["confirmed", "official", "according to", "statement", "report", "announced", "evidence"]
+        # LOCAL / REGIONAL sources (Pakistan + nearby; you can extend)
+        self.local_domains = [
+            "dawn.com", "geo.tv", "thenews.com.pk", "arynews.tv",
+            "tribune.com.pk", "samaa.tv", "dunya.com.pk", "bolnews.com",
+            "92newshd.tv", "radio.gov.pk", "nation.com.pk",
+            "pakobserver.net", "pid.gov.pk",
+        ]
 
-        # tiny in-memory cache (per process)
-        self._cache = {}
+        # refute/support words (snippet-level)
+        self.refute_words = [
+            "false", "fake", "hoax", "misleading", "debunk", "not true",
+            "rumor", "rumour", "fabricated", "baseless", "no evidence"
+        ]
+        self.support_words = [
+            "confirmed", "official", "according to", "statement", "report",
+            "announced", "verified", "police said", "authorities said"
+        ]
 
-    def _domain_score(self, url: str) -> float:
+    # -----------------------
+    # Utilities
+    # -----------------------
+    def _domain(self, url: str) -> str:
+        try:
+            return (urlparse(url).netloc or "").lower()
+        except Exception:
+            return ""
+
+    def _is_international(self, url: str) -> bool:
         u = (url or "").lower()
-        score = 0.0
-        for d in self.trusted_domains:
-            if d.startswith(".") and d in u:
-                score += 1.2
-            elif d in u:
-                score += 1.6
-        return score
+        return any(d in u for d in self.international_domains)
+
+    def _is_local(self, url: str) -> bool:
+        u = (url or "").lower()
+        return any(d in u for d in self.local_domains)
 
     def _allowed(self, url: str) -> bool:
         if not STRICT_TRUSTED_ONLY:
             return True
-        u = (url or "").lower()
-        return any(d in u for d in self.trusted_domains)
+        # strict: allow intl + local lists only
+        return self._is_international(url) or self._is_local(url)
 
     def _dedupe(self, items):
         seen = set()
         out = []
         for it in items:
             u = (it.get("url") or "").strip()
-            if not u:
-                continue
-            if u in seen:
+            if not u or u in seen:
                 continue
             seen.add(u)
             out.append(it)
         return out
 
+    def _keywords(self, text: str):
+        words = re.findall(r"[A-Za-z]{4,}", (text or "").lower())
+        uniq = list(dict.fromkeys(words))
+        return uniq[:16]
+
+    def _normalize(self, s: str) -> str:
+        s = (s or "").lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _jaccard_sim(self, a: str, b: str) -> float:
+        A = set(self._normalize(a).split())
+        B = set(self._normalize(b).split())
+        if not A or not B:
+            return 0.0
+        return len(A & B) / max(1, len(A | B))
+
+    def _tag_evidence(self, claim: str, blob: str) -> str:
+        t = (blob or "").lower()
+        if any(w in t for w in self.refute_words):
+            return "REFUTES"
+        if any(w in t for w in self.support_words):
+            return "SUPPORTS"
+
+        keys = set(self._keywords(claim))
+        if keys:
+            hit = sum(1 for k in keys if k in t)
+            if hit >= max(2, len(keys) // 3):
+                return "SUPPORTS"
+        return "NEUTRAL"
+
+    # -----------------------
+    # Web search
+    # -----------------------
     def _search_web(self, query: str):
+        q = (query or "").strip()
+        if not q:
+            return []
+        q_key = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        if q_key in self._query_cache:
+            return self._query_cache[q_key]
+
         results = []
         try:
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=MAX_SEARCH_RESULTS):
-                    url = r.get("href", "") or ""
+                for r in ddgs.text(q, max_results=SEARCH_RESULTS):
+                    url = (r.get("href") or "").strip()
+                    if not url:
+                        continue
                     if not self._allowed(url):
                         continue
-                    results.append(
-                        {
-                            "title": (r.get("title", "") or "").strip(),
-                            "url": url.strip(),
-                            "snippet": (r.get("body", "") or "").strip(),
-                        }
-                    )
+                    results.append({
+                        "title": (r.get("title") or "").strip(),
+                        "url": url,
+                        "snippet": (r.get("body") or "").strip(),
+                        "domain": self._domain(url),
+                    })
         except Exception:
             pass
+
+        results = self._dedupe(results)
+        self._query_cache[q_key] = results
         return results
 
+    # -----------------------
+    # Fetch page text (limited)
+    # -----------------------
     def _fetch_page_text(self, url: str) -> str:
         if not url or not url.startswith(("http://", "https://")):
             return ""
-
-        # cache
-        if url in self._cache:
-            return self._cache[url]
+        if url in self._page_cache:
+            return self._page_cache[url]
 
         last_err = None
         for _ in range(self.retries + 1):
             try:
                 r = requests.get(url, timeout=self.timeout, headers=self.headers)
                 r.raise_for_status()
-                soup = BeautifulSoup(r.text, "html.parser")
+                html = r.text
+
+                if trafilatura is not None:
+                    extracted = trafilatura.extract(html, include_comments=False, include_tables=False)
+                    if extracted and len(extracted.strip()) > 200:
+                        text = " ".join(extracted.split())[:6500]
+                        self._page_cache[url] = text
+                        return text
+
+                soup = BeautifulSoup(html, "html.parser")
                 for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
                     tag.decompose()
-                text = " ".join(soup.get_text(" ").split())
-                text = text[:7000]  # keep it light
-                self._cache[url] = text
+                text = " ".join(soup.get_text(" ").split())[:6500]
+                self._page_cache[url] = text
                 return text
+
             except Exception as e:
                 last_err = e
-                time.sleep(0.4)
+                time.sleep(0.35)
 
-        self._cache[url] = ""
+        self._page_cache[url] = ""
         return ""
 
-    def _keywords(self, claim: str):
-        words = re.findall(r"[A-Za-z]{4,}", (claim or "").lower())
-        # unique preserve order
-        uniq = list(dict.fromkeys(words))
-        return uniq[:14]
-
-    def _tag_evidence(self, claim: str, text: str):
-        t = (text or "").lower()
-
-        # strong refute
-        if any(w in t for w in self.refute_words):
-            return "REFUTES"
-        # strong support
-        if any(w in t for w in self.support_words):
-            return "SUPPORTS"
-
-        # weak support if claim keywords match well
-        keys = set(self._keywords(claim))
-        if keys:
-            hit = sum(1 for k in keys if k in t)
-            if hit >= max(2, len(keys) // 3):
-                return "SUPPORTS"
-
-        return "NEUTRAL"
-
+    # -----------------------
+    # Main check
+    # -----------------------
     def check(self, claim: str, url: str = ""):
         claim_clean = " ".join((claim or "").strip().split())
         if not claim_clean:
-            return {
-                "verdict": "UNKNOWN",
-                "confidence": 0.0,
-                "summary": "Empty claim.",
-                "sources": [],
-            }
+            return {"verdict": "UNKNOWN", "confidence": 0.0, "summary": "Empty claim.", "sources": [], "compare": {}}
 
-        # search queries
-        q1 = f"{claim_clean} fact check"
-        q2 = f"{claim_clean} Reuters OR BBC OR AP"
-        results = self._search_web(q1) + self._search_web(q2)
+        # If claim is short headline fragment, expand query
+        base_q = claim_clean
+        if len(base_q.split()) <= 9:
+            base_q = f"{base_q} what happened where when"
+
+        q_exact = f"\"{claim_clean}\""
+        q_fact = f"{base_q} fact check"
+        q_news = f"{base_q} news report"
+        q_intl = f"{base_q} Reuters OR BBC OR AP OR AlJazeera"
+        q_local = f"{base_q} Dawn OR Geo OR ARY OR Tribune OR Samaa"
+
+        # Search 100+ results (snippets)
+        results = []
+        for q in [q_exact, q_news, q_fact, q_intl, q_local]:
+            results.extend(self._search_web(q))
+
         results = self._dedupe(results)
 
-        # score and sort (trusted first + snippet length)
-        for r in results:
-            u = r.get("url", "")
-            r["_score"] = self._domain_score(u) + (0.2 if len(r.get("snippet", "")) > 120 else 0.0)
+        # Bucket into intl/local/other
+        intl = [r for r in results if self._is_international(r["url"])]
+        local = [r for r in results if self._is_local(r["url"])]
+        other = [r for r in results if (r not in intl and r not in local)]
 
-        results.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        # Similarity linking: do local and intl talk about SAME event?
+        # We'll compute best match pairs based on title+snippet similarity.
+        pairs = []
+        for li in local[:60]:
+            best = None
+            best_s = 0.0
+            ltxt = (li.get("title", "") + " " + li.get("snippet", "")).strip()
+            for ii in intl[:60]:
+                itxt = (ii.get("title", "") + " " + ii.get("snippet", "")).strip()
+                s = self._jaccard_sim(ltxt, itxt)
+                if s > best_s:
+                    best_s = s
+                    best = ii
+            if best and best_s >= SIM_THRESHOLD:
+                pairs.append({
+                    "local_title": li.get("title", ""),
+                    "local_url": li.get("url", ""),
+                    "intl_title": best.get("title", ""),
+                    "intl_url": best.get("url", ""),
+                    "similarity": round(best_s, 3),
+                })
 
-        # Build evidence list (top K), fetch page text if snippet too short
+        agreement_score = 0.0
+        if intl and local:
+            # proportion of local entries that have an intl match
+            agreement_score = min(1.0, len(pairs) / max(1, min(len(local), 30)))
+
+        # Now pick evidence candidates: prefer intl+local, then other
+        candidates = (intl + local + other)
+        candidates = candidates[:max(SEARCH_RESULTS, 120)]
+
+        # Fetch only top N pages for stronger snippets (avoid timeout)
         evidence = []
-        for r in results:
+        fetched = 0
+        for r in candidates:
             if len(evidence) >= EVIDENCE_K:
                 break
 
-            title = r.get("title", "") or "(no title)"
-            link = r.get("url", "")
-            snippet = (r.get("snippet", "") or "").strip()
+            title = r.get("title") or "(no title)"
+            link = r.get("url") or ""
+            snippet = (r.get("snippet") or "").strip()
 
-            # enhance snippet from page if too short
-            if len(snippet) < 80:
+            if len(snippet) < 90 and fetched < FETCH_TOP:
                 page_text = self._fetch_page_text(link)
                 if page_text:
                     snippet = page_text[:420]
+                fetched += 1
 
             tag = self._tag_evidence(claim_clean, snippet)
 
-            evidence.append(
-                {"title": title, "url": link, "snippet": snippet, "tag": tag}
-            )
+            evidence.append({
+                "title": title,
+                "url": link,
+                "snippet": snippet,
+                "tag": tag,
+                "bucket": "INTERNATIONAL" if self._is_international(link) else ("LOCAL" if self._is_local(link) else "OTHER"),
+                "domain": self._domain(link),
+            })
 
         supports = sum(1 for e in evidence if e["tag"] == "SUPPORTS")
         refutes = sum(1 for e in evidence if e["tag"] == "REFUTES")
 
-        # Decision policy: no guessing
-        # TRUE if >=2 supports and 0 refutes
-        # FALSE if >=2 refutes and refutes > supports
-        # else UNKNOWN
+        # Strict decision policy (no guessing):
+        # TRUE  => >=2 supports and 0 refutes AND agreement_score >= 0.15
+        # FALSE => >=2 refutes and refutes > supports
+        # else  => UNKNOWN
         if refutes >= 2 and refutes > supports:
             verdict = "FALSE"
             confidence = min(0.95, 0.60 + 0.10 * (refutes - supports))
-            summary = "Multiple sources contain debunk/refute signals. Treat as FALSE unless strong counter-evidence appears."
-        elif supports >= 2 and refutes == 0:
+            summary = "Multiple sources contain refute/debunk signals. Marked as FALSE."
+        elif supports >= 2 and refutes == 0 and agreement_score >= 0.15:
             verdict = "TRUE"
-            confidence = min(0.95, 0.60 + 0.08 * supports)
-            summary = "Multiple sources support/confirm signals and no refute signals found. Treat as TRUE."
+            confidence = min(0.95, 0.60 + 0.08 * supports + 0.15 * agreement_score)
+            summary = "Multiple sources support signals and cross-source agreement exists. Marked as TRUE."
         else:
             verdict = "UNKNOWN"
             confidence = 0.50
-            summary = "Not enough clean evidence (or mixed signals). No guessing — needs human verification."
+            if not evidence:
+                summary = "No reliable sources found. Add URL or make claim more specific."
+            else:
+                summary = "Evidence is mixed/weak or cross-source agreement is low. Marked UNKNOWN (no guessing)."
+
+        compare = {
+            "search_results_total": len(results),
+            "international_count": len(intl),
+            "local_count": len(local),
+            "other_count": len(other),
+            "matched_pairs": pairs[:10],  # show top 10 pairs
+            "agreement_score": round(agreement_score, 3),
+            "notes": f"Collected {len(results)} results; fetched {min(fetched, FETCH_TOP)} pages for stronger evidence.",
+        }
 
         return {
             "verdict": verdict,
             "confidence": float(confidence),
             "summary": summary,
             "sources": evidence,
+            "compare": compare,
         }
