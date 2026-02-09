@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import hashlib
 import torch
 import requests
 from bs4 import BeautifulSoup
@@ -12,21 +14,21 @@ from utils import clean_text, extract_url_features, clickbait_score
 ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "artifacts")
 BASE_MODEL = os.getenv("BASE_MODEL", "microsoft/deberta-v3-large")
 
+# Evidence settings
+EVIDENCE_K = int(os.getenv("EVIDENCE_K", "7"))
+MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "20"))
+STRICT_TRUSTED_ONLY = os.getenv("STRICT_TRUSTED_ONLY", "0") == "1"
+
 
 # =========================
-# 1) FAST CLASSIFIER (yours)
+# 1) FAST CLASSIFIER
 # =========================
 class FakeNewsMeter:
     def __init__(self, model_dir: str = ARTIFACTS_DIR):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # tokenizer from artifacts
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-
-        # base model from HF
         base = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL, num_labels=2)
-
-        # attach LoRA adapter
         self.model = PeftModel.from_pretrained(base, model_dir)
 
         self.model.eval()
@@ -65,113 +67,204 @@ class FakeNewsMeter:
 # ==========================================
 class EvidenceChecker:
     """
-    Evidence-based checker:
-    - If URL is provided: fetch page text (best-effort)
-    - Search web snippets for claim + "fact check"
-    - Return SUPPORTED / REFUTED / NOT_ENOUGH_EVIDENCE
+    Evidence checker that:
+    - searches the web (DuckDuckGo)
+    - ranks sources (trusted domains boosted)
+    - returns exactly top-K evidence with SUPPORT/REFUTE/NEUTRAL tags
+    - produces verdict: TRUE / FALSE / UNKNOWN (no guessing)
     """
 
-    def __init__(self, max_sources: int = 6, timeout: int = 12):
-        self.max_sources = max_sources
+    def __init__(self, timeout: int = 12, retries: int = 2):
         self.timeout = timeout
+        self.retries = retries
         self.headers = {"User-Agent": "Mozilla/5.0 (FakeNewsMeter/1.0)"}
 
-    def _fetch_article_text(self, url: str) -> str:
-        if not url or not url.startswith(("http://", "https://")):
-            return ""
-        try:
-            r = requests.get(url, timeout=self.timeout, headers=self.headers)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
+        # Trusted domains get higher score (not automatically "true", just higher priority)
+        self.trusted_domains = [
+            "bbc.com", "bbc.co.uk",
+            "reuters.com",
+            "apnews.com",
+            "who.int", "cdc.gov",
+            ".gov",
+            "wikipedia.org",
+            "politifact.com", "snopes.com", "factcheck.org", "afp.com",
+        ]
 
-            for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
-                tag.decompose()
+        # Keyword signals (simple + deploy-safe)
+        self.refute_words = ["false", "fake", "hoax", "misleading", "debunk", "not true", "rumor", "rumour"]
+        self.support_words = ["confirmed", "official", "according to", "statement", "report", "announced", "evidence"]
 
-            text = " ".join(soup.get_text(" ").split())
-            return text[:9000]  # limit for Streamlit stability
-        except Exception:
-            return ""
+        # tiny in-memory cache (per process)
+        self._cache = {}
+
+    def _domain_score(self, url: str) -> float:
+        u = (url or "").lower()
+        score = 0.0
+        for d in self.trusted_domains:
+            if d.startswith(".") and d in u:
+                score += 1.2
+            elif d in u:
+                score += 1.6
+        return score
+
+    def _allowed(self, url: str) -> bool:
+        if not STRICT_TRUSTED_ONLY:
+            return True
+        u = (url or "").lower()
+        return any(d in u for d in self.trusted_domains)
+
+    def _dedupe(self, items):
+        seen = set()
+        out = []
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if not u:
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(it)
+        return out
 
     def _search_web(self, query: str):
         results = []
         try:
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=self.max_sources):
+                for r in ddgs.text(query, max_results=MAX_SEARCH_RESULTS):
+                    url = r.get("href", "") or ""
+                    if not self._allowed(url):
+                        continue
                     results.append(
                         {
-                            "title": r.get("title", ""),
-                            "url": r.get("href", ""),
-                            "snippet": r.get("body", ""),
+                            "title": (r.get("title", "") or "").strip(),
+                            "url": url.strip(),
+                            "snippet": (r.get("body", "") or "").strip(),
                         }
                     )
         except Exception:
             pass
         return results
 
+    def _fetch_page_text(self, url: str) -> str:
+        if not url or not url.startswith(("http://", "https://")):
+            return ""
+
+        # cache
+        if url in self._cache:
+            return self._cache[url]
+
+        last_err = None
+        for _ in range(self.retries + 1):
+            try:
+                r = requests.get(url, timeout=self.timeout, headers=self.headers)
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text, "html.parser")
+                for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
+                    tag.decompose()
+                text = " ".join(soup.get_text(" ").split())
+                text = text[:7000]  # keep it light
+                self._cache[url] = text
+                return text
+            except Exception as e:
+                last_err = e
+                time.sleep(0.4)
+
+        self._cache[url] = ""
+        return ""
+
     def _keywords(self, claim: str):
-        words = re.findall(r"[A-Za-z]{4,}", claim.lower())
-        # keep only first ~14 keywords (enough)
-        return list(dict.fromkeys(words))[:14]
+        words = re.findall(r"[A-Za-z]{4,}", (claim or "").lower())
+        # unique preserve order
+        uniq = list(dict.fromkeys(words))
+        return uniq[:14]
+
+    def _tag_evidence(self, claim: str, text: str):
+        t = (text or "").lower()
+
+        # strong refute
+        if any(w in t for w in self.refute_words):
+            return "REFUTES"
+        # strong support
+        if any(w in t for w in self.support_words):
+            return "SUPPORTS"
+
+        # weak support if claim keywords match well
+        keys = set(self._keywords(claim))
+        if keys:
+            hit = sum(1 for k in keys if k in t)
+            if hit >= max(2, len(keys) // 3):
+                return "SUPPORTS"
+
+        return "NEUTRAL"
 
     def check(self, claim: str, url: str = ""):
-        claim_clean = " ".join(claim.strip().split())
+        claim_clean = " ".join((claim or "").strip().split())
         if not claim_clean:
             return {
-                "verdict": "NOT_ENOUGH_EVIDENCE",
+                "verdict": "UNKNOWN",
                 "confidence": 0.0,
                 "summary": "Empty claim.",
                 "sources": [],
             }
 
-        # 1) fetch article text (if URL)
-        article_text = self._fetch_article_text(url)
-        keys = self._keywords(claim_clean)
+        # search queries
+        q1 = f"{claim_clean} fact check"
+        q2 = f"{claim_clean} Reuters OR BBC OR AP"
+        results = self._search_web(q1) + self._search_web(q2)
+        results = self._dedupe(results)
 
-        # 2) web search
-        query = f"{claim_clean} fact check"
-        sources = self._search_web(query)
+        # score and sort (trusted first + snippet length)
+        for r in results:
+            u = r.get("url", "")
+            r["_score"] = self._domain_score(u) + (0.2 if len(r.get("snippet", "")) > 120 else 0.0)
 
-        # 3) scoring (simple but practical)
-        support_score = 0.0
-        refute_score = 0.0
+        results.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
 
-        # Support signal: many keywords appear in the provided URL text
-        if article_text and keys:
-            at = article_text.lower()
-            hit = sum(1 for k in keys if k in at)
-            support_score += min(1.0, hit / max(3, len(keys) // 2))
+        # Build evidence list (top K), fetch page text if snippet too short
+        evidence = []
+        for r in results:
+            if len(evidence) >= EVIDENCE_K:
+                break
 
-        # Refute/support signals from snippets
-        for s in sources:
-            snip = (s.get("snippet") or "").lower()
+            title = r.get("title", "") or "(no title)"
+            link = r.get("url", "")
+            snippet = (r.get("snippet", "") or "").strip()
 
-            # strong refute words
-            if any(x in snip for x in ["false", "fake", "hoax", "misleading", "debunk", "not true"]):
-                refute_score += 0.35
+            # enhance snippet from page if too short
+            if len(snippet) < 80:
+                page_text = self._fetch_page_text(link)
+                if page_text:
+                    snippet = page_text[:420]
 
-            # mild support words
-            if any(x in snip for x in ["confirmed", "official", "according to", "statement", "report"]):
-                support_score += 0.20
+            tag = self._tag_evidence(claim_clean, snippet)
 
-        # 4) decide verdict
-        margin = support_score - refute_score
+            evidence.append(
+                {"title": title, "url": link, "snippet": snippet, "tag": tag}
+            )
 
-        if margin >= 0.45:
-            verdict = "SUPPORTED"
-            confidence = min(0.95, 0.55 + margin)
-            summary = "Evidence snippets + URL text show signals that support this claim."
-        elif margin <= -0.45:
-            verdict = "REFUTED"
-            confidence = min(0.95, 0.55 + (-margin))
-            summary = "Evidence snippets include 'false/hoax/misleading' signals against this claim."
+        supports = sum(1 for e in evidence if e["tag"] == "SUPPORTS")
+        refutes = sum(1 for e in evidence if e["tag"] == "REFUTES")
+
+        # Decision policy: no guessing
+        # TRUE if >=2 supports and 0 refutes
+        # FALSE if >=2 refutes and refutes > supports
+        # else UNKNOWN
+        if refutes >= 2 and refutes > supports:
+            verdict = "FALSE"
+            confidence = min(0.95, 0.60 + 0.10 * (refutes - supports))
+            summary = "Multiple sources contain debunk/refute signals. Treat as FALSE unless strong counter-evidence appears."
+        elif supports >= 2 and refutes == 0:
+            verdict = "TRUE"
+            confidence = min(0.95, 0.60 + 0.08 * supports)
+            summary = "Multiple sources support/confirm signals and no refute signals found. Treat as TRUE."
         else:
-            verdict = "NOT_ENOUGH_EVIDENCE"
+            verdict = "UNKNOWN"
             confidence = 0.50
-            summary = "Could not reliably confirm or refute. Needs manual verification."
+            summary = "Not enough clean evidence (or mixed signals). No guessing — needs human verification."
 
         return {
             "verdict": verdict,
             "confidence": float(confidence),
             "summary": summary,
-            "sources": sources,
+            "sources": evidence,
         }
